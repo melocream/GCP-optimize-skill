@@ -378,6 +378,235 @@ DROP TABLE `project.dataset.table_backup`;
 - **불필요한 테이블 삭제**: 임시/실험/staging 테이블 정리
 - **사용하지 않는 API 비활성화**: Gemini Cloud Assist 등 불필요한 API가 활성화되어 있으면 비활성화
 
+### 4-5. BigQuery 비용 가드레일 (스케줄러/쿼리 등록 시 필수)
+
+> **왜 이 절이 있나 (사고 요약)**: on-demand BigQuery 는 **스캔한 바이트만큼 과금**된다($6.25/TB).
+> 파티션 프루닝이 빠진 쿼리 하나가 대형 테이블을 풀스캔하면 단건이 수 GB~수백 GB 이고,
+> 그게 배치/스케줄러로 매시간·매일 반복되면 비용이 선형이 아니라 **누적·폭증**한다.
+> 실제로 한 파이프라인에서 미프루닝 쿼리가 누적되며 일일 스캔이 ~485GB 까지 부풀었고,
+> 전체 데이터를 일괄 재계산하는 일회성 풀스캔(예: 전 엔터티 리포트 프리컴퓨트)이 며칠 만에 수십만 원대 청구를 냈다.
+> 핵심 교훈: **개별 쿼리의 파티션 필터는 1차 방어일 뿐, 사람·에이전트는 반드시 빠뜨린다.**
+> 그래서 아래 7개 패턴은 "조심하자"가 아니라 **빠뜨려도 비용이 안 터지게 만드는 다층 안전망**이다.
+> 새 쿼리/배치/스케줄러를 등록하는 모든 에이전트는 이 체크리스트를 그대로 따른다.
+
+#### 한눈에 보는 체크리스트
+
+- [ ] **1. 공용 클라이언트** — raw `bigquery.Client()` 대신 `maximum_bytes_billed` 백스톱이 박힌 래퍼 사용
+- [ ] **2. 파티션 필터** — 파티션 테이블 쿼리에 날짜/시간 컬럼 **범위 비교**(`>=`/`<`/`BETWEEN`) 포함 (ORDER BY 는 필터 아님)
+- [ ] **3. SELECT \* 금지** — 대형 테이블엔 필요한 컬럼만 명시
+- [ ] **4. PR 린터** — diff 추가(+) 라인만 검사하는 정적 린터를 CI 게이트로 (레거시 무영향)
+- [ ] **5. 일일 쿼터 + 알럿** — project/user 단위 일일 바이트 cap + 예산 알림
+- [ ] **6. 멱등 적재** — 재실행 안전한 MERGE 또는 DELETE+INSERT, 파티션 프루닝, 스트리밍 버퍼 함정 회피
+- [ ] **7. 화이트리스트** — 의도적 풀스캔(백필/마이그레이션/ML)은 명시적 예외 경로로 격리
+
+---
+
+#### 패턴 1 — 공용 클라이언트 래퍼 + `maximum_bytes_billed` 백스톱
+
+**왜**: 파티션 필터를 실수로 빠뜨리면 풀스캔이 **과금된 뒤에야** 알게 된다.
+클라이언트 생성 지점에 바이트 상한을 박아두면, 상한을 넘는 쿼리는 **과금 0으로 즉시 실패**한다.
+모든 코드가 raw `Client()` 대신 이 래퍼만 쓰게 강제하면 "필터 깜빡 → 청구 폭탄" 회귀가 원천 차단된다.
+
+```python
+# ❌ 금지 — 상한 없는 raw 클라이언트
+from google.cloud import bigquery
+client = bigquery.Client(project=PROJECT)
+
+# ✅ 공용 래퍼 — maximum_bytes_billed 기본 상한 내장
+import os
+from google.cloud import bigquery
+
+DEFAULT_MAX_GB = float(os.getenv("BQ_MAX_BYTES_BILLED_GB", "20"))  # 런타임 조정 가능
+
+def safe_bq_client(project=None, max_gb=None, **kwargs):
+    """maximum_bytes_billed 기본 상한이 박힌 bigquery.Client 반환.
+    상한 초과 쿼리는 과금 없이 즉시 실패 → 풀스캔 청구 폭탄 차단."""
+    gb = DEFAULT_MAX_GB if max_gb is None else max_gb
+    client = bigquery.Client(project=project, **kwargs)
+    if gb and gb > 0:  # gb<=0 은 백필/학습 등 풀스캔 정당 경로의 명시적 opt-out
+        client.default_query_job_config = bigquery.QueryJobConfig(
+            maximum_bytes_billed=int(gb * 1024 ** 3)
+        )
+    return client
+
+client = safe_bq_client(project=PROJECT)             # 기본 20GB 상한(넉넉한 헤드룸)
+light  = safe_bq_client(project=PROJECT, max_gb=2)   # 경량 배치는 타이트하게
+```
+
+- 상한은 `default_query_job_config` 에 들어가므로 그 클라이언트의 **모든** `query()` 에 자동 적용.
+- 특정 호출만 큰 스캔이 필요하면 그 호출에만 `job_config` 를 넘겨 override.
+- 환경변수로 전역 상한을 노출하면 재배포 없이 런타임 조정 가능.
+
+#### 패턴 2 — 파티션 테이블엔 파티션 필터(날짜 범위 비교) 필수
+
+**왜**: 파티션 컬럼이 단순히 등장하는 것(`ORDER BY created_at`)으로는 프루닝이 **안 된다**.
+옵티마이저는 `WHERE` 의 **범위 비교**가 있어야 읽을 파티션을 좁힌다.
+이 한 줄 차이가 풀스캔(수 GB)과 하루치 스캔(수 MB)을 가른다.
+
+```sql
+-- ❌ 풀스캔 — created_at 이 ORDER BY 에만 등장(필터 아님)
+SELECT id, status FROM `ds.events` ORDER BY created_at DESC
+
+-- ✅ 타임스탬프 파티션 범위 비교
+SELECT id, status FROM `ds.events`
+WHERE created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+
+-- ✅ DATE 파티션 범위 비교
+SELECT id, value FROM `ds.metrics_daily`
+WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+
+-- ✅ JOIN 은 양쪽 테이블 모두 파티션 필터
+FROM `ds.events` e
+JOIN `ds.event_items` i ON e.id = i.event_id
+WHERE e.created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+  AND i.created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+```
+
+- **UPDATE/DELETE/MERGE 에도 동일** — DML 의 풀스캔은 더 비싸다(읽기+쓰기).
+- 파티션 절을 변수로 주입하는 동적 SQL 이라면, 변수명에 `partition`/`filter`/`where` 같은
+  힌트를 넣어 린터(패턴 4)가 오탐하지 않게 한다.
+
+#### 패턴 3 — 대형 테이블 `SELECT *` 금지
+
+**왜**: BigQuery 는 컬럼 지향(columnar)이라 **읽은 컬럼의 바이트만 과금**된다.
+`SELECT *` 는 안 쓰는 컬럼까지 전부 읽어 스캔량을 수 배로 부풀린다. 필요한 컬럼만 명시한다.
+
+```sql
+-- ❌ 안 쓰는 컬럼까지 전부 스캔
+SELECT * FROM `ds.events` WHERE created_at >= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+
+-- ✅ 필요한 컬럼만
+SELECT id, symbol, status FROM `ds.events` WHERE created_at >= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+```
+
+- CTE/서브쿼리 alias 에 대한 `SELECT * FROM cte` 는 무방(이미 컬럼이 좁혀진 중간 결과).
+- 탐색용 쿼리엔 `LIMIT` 을 붙인다(단, `LIMIT` 은 스캔량을 줄이지 않으니 비용 절감용이 아님 — 결과 크기만 제한).
+
+#### 패턴 4 — PR diff 추가(+) 라인만 검사하는 정적 린터 + CI 게이트
+
+**왜**: 런타임 백스톱(패턴 1)은 마지막 안전망일 뿐, 풀스캔을 **머지 전에** 막는 게 더 싸다.
+단, 전체 파일을 검사하면 레거시 부채(상한 없는 raw client 수십 곳 등)가 무더기로 잡혀
+정상 PR 도 fail 나고 가드레일이 무력화된다. 그래서 **PR diff 의 추가(+) 라인만** 검사한다 —
+신규 안티패턴은 막고 레거시는 안 건드린다. AST 기반이면 SQL 문자열의 라인 범위를 정확히 잡아
+정규식보다 오탐이 적다.
+
+검출할 안티패턴(코드별로 룰 ID 부여 권장):
+
+| 룰 | 검출 | 대응 패턴 |
+|----|------|-----------|
+| 공용클라 미사용 | raw `bigquery.Client(` 직접 생성 | 패턴 1 |
+| 파티션필터 부재 | 파티션 테이블 쿼리에 범위 비교 없음 | 패턴 2 |
+| SELECT * | 대형 테이블 직접 `SELECT *` | 패턴 3 |
+| 캡 부재 | raw `.query()` 에 `maximum_bytes_billed` 없음 | 패턴 1 |
+
+```bash
+# CI: 기본 브랜치 대비 변경된 .py 의 추가(+) 라인만 검사
+python bq_lint.py --base origin/main      # 위반 발견 시 exit 1 → 머지 차단
+python bq_lint.py --all-lines file.py     # 파일 전체 검사(점검용)
+```
+
+핵심 구현 포인트(언어 무관 원리):
+- diff `--unified=0` 으로 추가된 라인 번호 집합을 뽑고, SQL 리터럴의 라인 범위와 **교차**하는 위반만 보고.
+- "파티션 필터 있음" 은 컬럼 등장이 아니라 **비교 연산자 동반**으로 판정.
+- CI 워크플로우(GitHub Actions 등)에서 required check 로 걸어 머지 게이트화.
+
+#### 패턴 5 — 프로젝트/사용자 일일 쿼터 + 비용 모니터링/알럿
+
+**왜**: 패턴 1~4 가 다 뚫려도(예: 화이트리스트 경로의 폭주, 새 도구의 우회) **조직 차원 상한**이
+마지막 방어선이다. on-demand 프로젝트엔 일일 쿼리 바이트 cap 을, 비용엔 예산 알림을 건다.
+
+```bash
+# 프로젝트/사용자 단위 일일 쿼리 바이트 상한 (단위·정확한 metric 명은 현행 gcloud 문서 확인)
+gcloud alpha services quota update \
+  --service=bigquery.googleapis.com \
+  --consumer=projects/$PROJECT \
+  --metric=bigquery.googleapis.com/quota/query/usage \
+  --unit=1/d/{project} --value=<DAILY_BYTES_CAP>
+
+# 비용 알림 — 예산 + 임계 알림(50/90/100%)
+gcloud billing budgets create \
+  --billing-account=<BILLING_ACCT> \
+  --display-name="bq-daily-guard" \
+  --budget-amount=<AMOUNT> \
+  --threshold-rule=percent=0.5 --threshold-rule=percent=0.9 --threshold-rule=percent=1.0
+```
+
+```sql
+-- 일별 스캔량/비용 모니터링 (INFORMATION_SCHEMA.JOBS, region 접두사 주의)
+SELECT DATE(creation_time) dt,
+       ROUND(SUM(total_bytes_billed)/1e9, 1) gb,
+       ROUND(SUM(total_bytes_billed)/1e12 * 6.25, 2) usd
+FROM `region-us`.INFORMATION_SCHEMA.JOBS
+WHERE creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 14 DAY)
+  AND job_type = 'QUERY'
+GROUP BY dt ORDER BY dt DESC;
+```
+
+> ⚠️ **주의**: 일일 cap 은 소진 시 그 프로젝트의 **모든** 쿼리를 차단한다(서빙 포함). cap 은
+> 정상 일일 사용량보다 충분히 높게(예: 평소의 3~5배) 잡아 catastrophic 폭주만 거르게 한다.
+
+#### 패턴 6 — 멱등 적재(MERGE / DELETE+INSERT) + 파티션 프루닝
+
+**왜**: 배치는 재시도·중복 트리거가 일상이라 **재실행해도 결과가 같아야**(idempotent) 한다.
+naive `INSERT` 는 재실행마다 중복 행을 쌓고, 그 중복이 다시 다운스트림 풀스캔 비용을 키운다.
+MERGE 또는 "해당 파티션 DELETE 후 INSERT" 로 멱등화하되, **삭제/병합도 파티션 프루닝**을 건다.
+
+```sql
+-- ✅ MERGE 업서트 — 키 충돌 시 갱신, 아니면 삽입 (ON 절에 파티션 범위 포함해 프루닝)
+MERGE `ds.daily_metrics` T
+USING `ds._staging_today` S
+ON T.id = S.id AND T.date = S.date
+   AND T.date >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)   -- 대상 파티션만
+WHEN MATCHED THEN UPDATE SET value = S.value
+WHEN NOT MATCHED THEN INSERT (id, date, value) VALUES (S.id, S.date, S.value);
+
+-- ✅ 대안: 파티션 단위 DELETE + INSERT (해당 날짜만 멱등 재적재)
+DELETE FROM `ds.daily_metrics` WHERE date = DATE('2026-06-18');  -- 파티션 프루닝됨
+INSERT INTO `ds.daily_metrics` (id, date, value) SELECT id, date, value FROM `ds._staging_today`;
+```
+
+> ⚠️ **스트리밍 버퍼 함정**: `insertAll`(스트리밍 삽입)로 막 적재한 행은 수십 분간
+> **스트리밍 버퍼**에 머물러 `UPDATE/DELETE/MERGE` 대상이 **안 된다**(에러 발생).
+> 멱등 재적재가 필요한 배치는 스트리밍 대신 **load job** 또는 `INSERT ... SELECT` 를 쓴다.
+
+#### 패턴 7 — 화이트리스트(의도적 풀스캔 정상 경로) 운영
+
+**왜**: 백필, 일회성 마이그레이션, ML 피처 추출은 **풀스캔이 설계상 정상**이다.
+이들까지 린터/상한으로 막으면 정당한 작업이 깨진다. 그래서 "의도적 풀스캔" 을 **명시적 예외 경로**로
+격리한다 — 경로 컨벤션(예: `backfill_*`, `migrate_*`, `ml/`)으로 화이트리스트하고, 그 경로는
+린터 제외 + 상한 opt-out(`max_gb<=0`)을 허용한다. 핵심은 **예외가 눈에 보이고 의도적**이어야 한다는 것.
+
+```python
+# 린터 화이트리스트 — 경로 substring 매칭 (의도적 풀스캔/대용량이 정상인 경로)
+WHITELIST_SUBSTRINGS = ("backfill_", "migrate_", "/ml/", "/oneoff/")
+
+# 상한 opt-out — 풀스캔 정당 경로에서만 명시적으로
+client = safe_bq_client(project=PROJECT, max_gb=0)  # 무제한(백필 전용)
+```
+
+운영 원칙:
+- 화이트리스트는 **좁게** 유지하고 PR 리뷰에서 추가를 검토. 늘어나면 가드레일이 샌다.
+- 일회성 대형 스캔(전체 재적재/프리컴퓨트)은 실행 전 `--dry_run` 으로 **스캔량을 먼저 추정**한다.
+
+```bash
+# 실행 전 스캔량 추정 (과금 0) — 예상보다 크면 쿼리부터 고친다
+bq query --use_legacy_sql=false --dry_run \
+  'SELECT id FROM `ds.events` WHERE created_at >= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)'
+```
+
+#### 다층 방어 요약
+
+| 층 | 막는 것 | 누가 |
+|----|---------|------|
+| 파티션 필터·컬럼 선택 (패턴 2·3) | 풀스캔 자체 | 쿼리 작성자 |
+| PR 린터 (패턴 4) | 신규 안티패턴 머지 | CI 게이트 |
+| `maximum_bytes_billed` 백스톱 (패턴 1) | 필터 누락이 과금되는 것 | 공용 클라이언트 |
+| 일일 쿼터 + 알럿 (패턴 5) | 위 전부 뚫린 폭주 | 조직 정책 |
+| 멱등 적재 (패턴 6) | 재실행 중복·누적 비용 | 배치 설계 |
+| 화이트리스트 (패턴 7) | 정당한 풀스캔이 막히는 것 | 명시적 예외 |
+
+> 한 층은 반드시 뚫린다는 전제로 설계한다. 어느 한 층이 실패해도 다음 층이 비용 폭증을 막는다.
+
 ---
 
 ## 5. Cloud Logging 점검
